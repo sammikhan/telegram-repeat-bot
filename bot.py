@@ -37,7 +37,7 @@ async def remind(context: ContextTypes.DEFAULT_TYPE):
 
 async def main():
     if not TOKEN:
-        raise RuntimeError("BOT_TOKEN yo‘q. Render Environment’da qo‘shing.")
+        raise RuntimeError("BOT_TOKEN yo‘q. Railway Variables’da qo‘shing.")
 
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("add", add))
