@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("8048157426:AAEPoBOkPszcUGUi339qUaR7Q3R8STB_YtM")
 
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
