@@ -5,22 +5,41 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ====== ENV ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
 
-# 1 / 3 / 7 / 30
 REMIND_DAYS = [1, 3, 7, 30]
 
 
-# ---------------- DB ----------------
+# -------- helpers --------
+def ensure_aware_utc(dt: datetime) -> datetime:
+    """Make sure datetime is timezone-aware UTC (asyncpg TIMESTAMPTZ needs this)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
+
+def human_left(target_dt: datetime) -> str:
+    now = datetime.now(timezone.utc)
+    target_dt = ensure_aware_utc(target_dt)
+    seconds_left = int((target_dt - now).total_seconds())
+    if seconds_left <= 0:
+        return "hozir"
+
+    days = seconds_left // 86400
+    hours = (seconds_left % 86400) // 3600
+    mins = (seconds_left % 3600) // 60
+
+    if days > 0:
+        return f"{days} kun {hours} soat qoldi"
+    if hours > 0:
+        return f"{hours} soat {mins} daqiqa qoldi"
+    return f"{mins} daqiqa qoldi"
+
+
+# -------- DB --------
 async def init_db():
     conn = await asyncpg.connect(DATABASE_URL)
     try:
@@ -40,13 +59,11 @@ async def init_db():
 
 
 async def add_reminders(chat_id: int, text: str):
-    # ✅ timezone-aware UTC time
-    now = datetime.now(timezone.utc)
-
+    now = datetime.now(timezone.utc)  # ✅ aware UTC
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         for d in REMIND_DAYS:
-            remind_at = now + timedelta(days=d)
+            remind_at = ensure_aware_utc(now + timedelta(days=d))
             await conn.execute(
                 "INSERT INTO reminders(chat_id, text, remind_at) VALUES ($1, $2, $3)",
                 chat_id, text, remind_at
@@ -58,13 +75,12 @@ async def add_reminders(chat_id: int, text: str):
 async def list_pending_rows(chat_id: int):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        rows = await conn.fetch("""
+        return await conn.fetch("""
             SELECT text, remind_at
             FROM reminders
             WHERE sent = FALSE AND chat_id = $1
             ORDER BY remind_at
         """, chat_id)
-        return rows
     finally:
         await conn.close()
 
@@ -72,14 +88,13 @@ async def list_pending_rows(chat_id: int):
 async def next_pending_row(chat_id: int):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        row = await conn.fetchrow("""
+        return await conn.fetchrow("""
             SELECT text, remind_at
             FROM reminders
             WHERE sent = FALSE AND chat_id = $1
             ORDER BY remind_at
             LIMIT 1
         """, chat_id)
-        return row
     finally:
         await conn.close()
 
@@ -87,14 +102,13 @@ async def next_pending_row(chat_id: int):
 async def fetch_due(limit: int = 50):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        rows = await conn.fetch("""
-            SELECT id, chat_id, text, remind_at
+        return await conn.fetch("""
+            SELECT id, chat_id, text
             FROM reminders
             WHERE sent = FALSE AND remind_at <= NOW()
             ORDER BY remind_at
             LIMIT $1
         """, limit)
-        return rows
     finally:
         await conn.close()
 
@@ -102,36 +116,12 @@ async def fetch_due(limit: int = 50):
 async def mark_sent(reminder_id: int):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        await conn.execute(
-            "UPDATE reminders SET sent = TRUE WHERE id = $1",
-            reminder_id
-        )
+        await conn.execute("UPDATE reminders SET sent = TRUE WHERE id = $1", reminder_id)
     finally:
         await conn.close()
 
 
-# ---------------- HELPERS ----------------
-
-def human_left(target_dt) -> str:
-    """target_dt is timezone-aware from asyncpg (TIMESTAMPTZ)."""
-    now = datetime.now(timezone.utc)
-    seconds_left = int((target_dt - now).total_seconds())
-    if seconds_left <= 0:
-        return "hozir"
-
-    days = seconds_left // 86400
-    hours = (seconds_left % 86400) // 3600
-    mins = (seconds_left % 3600) // 60
-
-    if days > 0:
-        return f"{days} kun {hours} soat qoldi"
-    if hours > 0:
-        return f"{hours} soat {mins} daqiqa qoldi"
-    return f"{mins} daqiqa qoldi"
-
-
-# ---------------- COMMANDS ----------------
-
+# -------- commands --------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Salom! Men takrorlash botiman ✅\n\n"
@@ -153,11 +143,15 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = " ".join(context.args).strip()
 
-    await add_reminders(chat_id, text)
-
-    await update.message.reply_text(
-        f"✅ Saqlandi!\n📌 {text}\n⏰ 1 / 3 / 7 / 30 kunda eslatadi."
-    )
+    try:
+        await add_reminders(chat_id, text)
+        await update.message.reply_text(
+            f"✅ Saqlandi!\n📌 {text}\n⏰ 1 / 3 / 7 / 30 kunda eslatadi."
+        )
+    except Exception as e:
+        # Sizga ham ko'rinsin (qisqa)
+        await update.message.reply_text(f"❌ /add xato: {type(e).__name__}")
+        raise  # logga ham tushsin
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,12 +162,10 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Aktiv eslatmalar yo‘q. /add bilan qo‘shing.")
         return
 
-    # Bitta mavzu uchun 4 ta remind bo‘ladi. Chiroyli ko‘rinishi uchun:
-    # har bir text bo‘yicha eng yaqin remind_at ni chiqaramiz.
     nearest = defaultdict(lambda: None)
     for r in rows:
         t = r["text"]
-        ra = r["remind_at"]
+        ra = ensure_aware_utc(r["remind_at"])
         if nearest[t] is None or ra < nearest[t]:
             nearest[t] = ra
 
@@ -193,15 +185,15 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Yaqin eslatma yo‘q. /add bilan qo‘shing.")
         return
 
+    ra = ensure_aware_utc(row["remind_at"])
     await update.message.reply_text(
         "⏭ Eng yaqin takrorlash:\n\n"
         f"📌 {row['text']}\n"
-        f"⏳ {human_left(row['remind_at'])}"
+        f"⏳ {human_left(ra)}"
     )
 
 
-# ---------------- WORKER ----------------
-
+# -------- worker --------
 async def reminder_worker(app):
     while True:
         try:
@@ -223,11 +215,8 @@ async def reminder_worker(app):
 
 async def post_init(app):
     await init_db()
-    # ✅ start worker after app init
     asyncio.create_task(reminder_worker(app))
 
-
-# ---------------- MAIN ----------------
 
 def main():
     if not BOT_TOKEN:
@@ -236,7 +225,6 @@ def main():
         raise RuntimeError("DATABASE_URL yo‘q. Railway Postgres ulanmagan (Variables’da bo‘lishi kerak).")
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("list", list_cmd))
