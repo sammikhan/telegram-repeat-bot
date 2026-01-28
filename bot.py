@@ -1,7 +1,7 @@
 import os
 import asyncio
 import asyncpg
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.ext import (
@@ -25,56 +25,84 @@ async def init_db():
             id SERIAL PRIMARY KEY,
             chat_id BIGINT NOT NULL,
             text TEXT NOT NULL,
-            remind_at TIMESTAMP NOT NULL,
+            remind_at TIMESTAMPTZ NOT NULL,
             sent BOOLEAN DEFAULT FALSE
         );
     """)
     await conn.close()
 
 
-async def add_reminder(chat_id: int, text: str, remind_at: datetime):
+async def add_reminders(chat_id: int, text: str):
+    now = datetime.now(timezone.utc)
     conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute(
-        "INSERT INTO reminders(chat_id, text, remind_at) VALUES ($1, $2, $3)",
-        chat_id, text, remind_at
-    )
-    await conn.close()
+    try:
+        for d in REMIND_DAYS:
+            remind_at = now + timedelta(days=d)
+            await conn.execute(
+                "INSERT INTO reminders(chat_id, text, remind_at) VALUES ($1, $2, $3)",
+                chat_id, text, remind_at
+            )
+    finally:
+        await conn.close()
 
 
-async def get_pending_reminders():
+async def list_pending(chat_id: int):
     conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch(
-        "SELECT id, chat_id, text, remind_at FROM reminders WHERE sent = FALSE"
-    )
-    await conn.close()
-    return rows
+    try:
+        rows = await conn.fetch("""
+            SELECT text, remind_at
+            FROM reminders
+            WHERE sent = FALSE AND chat_id = $1
+            ORDER BY remind_at
+        """, chat_id)
+        return rows
+    finally:
+        await conn.close()
+
+
+async def fetch_due():
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch("""
+            SELECT id, chat_id, text
+            FROM reminders
+            WHERE sent = FALSE AND remind_at <= NOW()
+            ORDER BY remind_at
+            LIMIT 50
+        """)
+        return rows
+    finally:
+        await conn.close()
 
 
 async def mark_sent(reminder_id: int):
     conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute(
-        "UPDATE reminders SET sent = TRUE WHERE id = $1",
-        reminder_id
+    try:
+        await conn.execute("UPDATE reminders SET sent = TRUE WHERE id = $1", reminder_id)
+    finally:
+        await conn.close()
+
+
+# ---------------- COMMANDS ----------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Salom! 👋\n\n"
+        "Mavzu qo‘shish: /add mavzu\n"
+        "Ro‘yxat: /list\n\n"
+        "Eslatma: 1 / 3 / 7 / 30 kun"
     )
-    await conn.close()
 
-
-# ---------------- BOT ----------------
 
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(
-            "✍️ Yozing:\n/add Bugun o‘rgangan mavzu"
-        )
+        await update.message.reply_text("✍️ Yozing:\n/add Bugun o‘rgangan mavzu")
         return
 
     text = " ".join(context.args)
     chat_id = update.effective_chat.id
-    now = datetime.utcnow()
 
-    for d in REMIND_DAYS:
-        remind_at = now + timedelta(days=d)
-        await add_reminder(chat_id, text, remind_at)
+    await add_reminders(chat_id, text)
 
     await update.message.reply_text(
         f"✅ Saqlandi!\n\n📌 {text}\n\n⏰ Eslatma: 1 / 3 / 7 / 30 kunda"
@@ -82,74 +110,80 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch("""
-        SELECT text, remind_at
-        FROM reminders
-        WHERE sent = FALSE AND chat_id = $1
-        ORDER BY remind_at
-    """, update.effective_chat.id)
-    await conn.close()
+    chat_id = update.effective_chat.id
+    rows = await list_pending(chat_id)
 
     if not rows:
         await update.message.reply_text("📭 Aktiv eslatmalar yo‘q.")
         return
 
+    now = datetime.now(timezone.utc)
     msg = "📋 Aktiv eslatmalar:\n\n"
-    now = datetime.utcnow()
+
+    # bir xil text bo‘yicha eng yaqin remind_at ni ko‘rsatamiz (chiroyli bo‘lishi uchun)
+    # (chunki bitta mavzu 4 ta remind bo‘ladi)
+    from collections import defaultdict
+    nearest = defaultdict(lambda: None)
 
     for r in rows:
-        days_left = (r["remind_at"] - now).days
-        msg += f"• {r['text']} — ⏳ {days_left} kun qoldi\n"
+        t = r["text"]
+        ra = r["remind_at"]
+        if nearest[t] is None or ra < nearest[t]:
+            nearest[t] = ra
 
+    for t, ra in nearest.items():
+        days_left = max(0, int((ra - now).total_seconds() // 86400))
+        msg += f"• {t}\n   ⏳ {days_left} kun qoldi (eng yaqin)\n"
+
+    msg += "\nℹ️ Har mavzu uchun 1/3/7/30 kunda 4 ta eslatma bo‘ladi."
     await update.message.reply_text(msg)
 
 
-# ---------------- SCHEDULER ----------------
+# ---------------- WORKER ----------------
 
 async def reminder_worker(app):
+    # abadiy loop: vaqti kelganlarini yuboradi
     while True:
-        conn = await asyncpg.connect(DATABASE_URL)
-        rows = await conn.fetch("""
-            SELECT id, chat_id, text
-            FROM reminders
-            WHERE sent = FALSE AND remind_at <= NOW()
-        """)
-        await conn.close()
-
-        for r in rows:
-            try:
-                await app.bot.send_message(
-                    chat_id=r["chat_id"],
-                    text=f"⏰ Takrorlash vaqti!\n\n📌 {r['text']}"
-                )
-                await mark_sent(r["id"])
-            except Exception as e:
-                print("Send error:", e)
+        try:
+            due = await fetch_due()
+            for r in due:
+                try:
+                    await app.bot.send_message(
+                        chat_id=r["chat_id"],
+                        text=f"⏰ Takrorlash vaqti!\n\n📌 {r['text']}"
+                    )
+                    await mark_sent(r["id"])
+                except Exception as e:
+                    print("Send error:", e)
+        except Exception as e:
+            print("Worker error:", e)
 
         await asyncio.sleep(30)
 
 
+async def post_init(app):
+    # DB tayyorlab, worker'ni bir marta start qilamiz
+    await init_db()
+    app.create_task(reminder_worker(app))
+
+
 # ---------------- MAIN ----------------
 
-async def main():
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN yo‘q (Railway Variables’da qo‘shing)")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL yo‘q (Postgres ulanmagan)")
 
-    await init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("list", list_cmd))
 
-    asyncio.create_task(reminder_worker(app))
-
     print("🤖 Bot ishga tushdi...")
-    await app.run_polling()
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
